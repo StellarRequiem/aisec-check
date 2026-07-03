@@ -7,6 +7,7 @@ Normalized finding schema (shared with mcp-bench so scoring/parsing is reused):
 Detectors:
   * vendored access-control scanner (``acdiff``) — auth-bypass / idor / secret-leak / ssrf / path-traversal
   * new rules (``rules``) — unsafe-deserialization / plaintext-secret-storage / world-readable-secret
+    / ssrf-url-fetch / hardcoded-secret / template-injection / command-injection
   * optional bundled 3rd-party SARIF scanners, normalized via ``mcpbench.parse_sarif`` (import; only
     invoked in the disposable CI runner, never on a host — see .github/workflows/scan.yml)
 """
@@ -29,6 +30,10 @@ _CLASS_SEV = {
     "unsafe-deserialization": "high",
     "plaintext-secret-storage": "medium",
     "world-readable-secret": "high",
+    "ssrf-url-fetch": "high",
+    "hardcoded-secret": "high",
+    "template-injection": "high",
+    "command-injection": "high",
 }
 
 

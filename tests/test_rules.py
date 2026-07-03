@@ -67,5 +67,130 @@ def test_world_readable_nonsecret_not_flagged():
     assert "world-readable-secret" not in _classes("import os\nos.chmod('public.html', 0o644)\n")
 
 
+# ── R4: SSRF — server-side fetch of a non-literal URL ────────────────────────────────────
+def test_requests_get_variable_url_flagged():
+    assert "ssrf-url-fetch" in _classes("import requests\ndef f(url):\n    return requests.get(url)\n")
+
+
+def test_httpx_post_variable_url_flagged():
+    assert "ssrf-url-fetch" in _classes("import httpx\ndef f(u):\n    return httpx.post(u, json={})\n")
+
+
+def test_urlopen_variable_flagged():
+    src = "from urllib.request import urlopen\ndef f(u):\n    return urlopen(u)\n"
+    assert "ssrf-url-fetch" in _classes(src)
+
+
+def test_requests_get_literal_url_safe():
+    src = "import requests\nrequests.get('https://api.example.com/health')\n"
+    assert "ssrf-url-fetch" not in _classes(src)
+
+
+def test_session_request_method_url_flagged():
+    # session.request('GET', url) → url is the 2nd positional and non-literal.
+    # Receiver must be a client-shaped name ('session'/'client') to keep the rule precise —
+    # a bare local like `s` is intentionally NOT matched.
+    src = "def f(session, url):\n    return session.request('GET', url)\n"
+    assert "ssrf-url-fetch" in _classes(src)
+
+
+# ── R5: hardcoded secret literal ─────────────────────────────────────────────────────────
+def test_hardcoded_openai_key_flagged():
+    src = "api_key = 'sk-abcdef0123456789abcdef0123456789'\n"
+    assert "hardcoded-secret" in _classes(src)
+
+
+def test_hardcoded_aws_key_flagged():
+    src = "AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\n"
+    assert "hardcoded-secret" in _classes(src)
+
+
+def test_secret_kwarg_literal_flagged():
+    src = "connect(password='AKIAIOSFODNN7EXAMPLE')\n"
+    assert "hardcoded-secret" in _classes(src)
+
+
+def test_secret_name_nonsecret_value_safe():
+    # secret-shaped NAME but the value is not credential-shaped → not flagged (precision)
+    assert "hardcoded-secret" not in _classes("api_key = 'API_KEY'\n")
+
+
+def test_secretshaped_value_nonsecret_name_safe():
+    # a long hex value bound to a non-secret name → not flagged (requires both)
+    assert "hardcoded-secret" not in _classes("checksum = '" + "a" * 40 + "'\n")
+
+
+# ── R6: template injection (SSTI) ────────────────────────────────────────────────────────
+def test_environment_autoescape_false_flagged():
+    src = "from jinja2 import Environment\nEnvironment(autoescape=False)\n"
+    assert "template-injection" in _classes(src)
+
+
+def test_template_from_variable_flagged():
+    src = "from jinja2 import Template\ndef f(t):\n    return Template(t).render()\n"
+    assert "template-injection" in _classes(src)
+
+
+def test_from_string_variable_flagged():
+    src = "def f(env, t):\n    return env.from_string(t)\n"
+    assert "template-injection" in _classes(src)
+
+
+def test_template_literal_safe():
+    src = "from jinja2 import Template\nTemplate('Hi {{ name }}').render(name='x')\n"
+    assert "template-injection" not in _classes(src)
+
+
+def test_environment_autoescape_true_safe():
+    src = "from jinja2 import Environment\nEnvironment(autoescape=True)\n"
+    assert "template-injection" not in _classes(src)
+
+
+# ── R7: command injection ────────────────────────────────────────────────────────────────
+def test_subprocess_shell_true_variable_flagged():
+    src = "import subprocess\ndef f(cmd):\n    return subprocess.run(cmd, shell=True)\n"
+    assert "command-injection" in _classes(src)
+
+
+def test_os_system_fstring_flagged():
+    src = "import os\ndef f(name):\n    return os.system(f'echo {name}')\n"
+    assert "command-injection" in _classes(src)
+
+
+def test_os_popen_variable_flagged():
+    src = "import os\ndef f(c):\n    return os.popen(c)\n"
+    assert "command-injection" in _classes(src)
+
+
+def test_subprocess_argv_list_safe():
+    # no shell, argv list → not flagged
+    src = "import subprocess\ndef f(name):\n    return subprocess.run(['echo', name])\n"
+    assert "command-injection" not in _classes(src)
+
+
+def test_subprocess_shell_true_literal_safe():
+    # shell=True but a fully-literal command → static, not flagged
+    src = "import subprocess\nsubprocess.run('ls -la', shell=True)\n"
+    assert "command-injection" not in _classes(src)
+
+
+# ── fixtures: vulnerable fires, safe is silent (mirrors deser_secrets fixture pair) ───────
+_NEW_CLASSES = {"ssrf-url-fetch", "hardcoded-secret", "template-injection", "command-injection"}
+
+
+def _fixture_classes(kind):
+    import pathlib
+    p = pathlib.Path(__file__).parent / "fixtures" / kind / "webfetch_exec.py"
+    return {d.finding_class for d in rules.scan_source(p.read_text(), file="webfetch_exec.py", target="t")}
+
+
+def test_vulnerable_fixture_fires_all_new_rules():
+    assert _NEW_CLASSES <= _fixture_classes("vulnerable")
+
+
+def test_safe_fixture_silent_on_new_rules():
+    assert not (_NEW_CLASSES & _fixture_classes("safe"))
+
+
 def test_syntax_error_returns_empty():
     assert rules.scan_source("def (:\n", file="t.py", target="t") == []

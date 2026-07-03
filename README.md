@@ -32,6 +32,10 @@ New rules (this package's delta; file-level AST):
 | `unsafe-deserialization` | `pickle.load`/`pickle.loads`/`dill.load`, `torch.load(...)` **without** `weights_only=True`, `yaml.load(...)` **without** a `SafeLoader` |
 | `plaintext-secret-storage` | a secret-shaped path opened for **write** (`open("api_token.txt", "w")`), or a `with open(..., "w")` block that writes a secret-shaped variable/literal |
 | `world-readable-secret` | `chmod(...)` granting an "other" (world) read/write/execute bit on a secret-shaped path |
+| `ssrf-url-fetch` | `requests`/`httpx`/`aiohttp` `.get`/`.post`/… or `urllib` `urlopen(...)` where the URL is a **non-literal** (variable/param/f-string) — a server-side fetch of a caller/model-controlled URL with no in-call literal allowlist |
+| `hardcoded-secret` | an assignment (or secret-named kwarg) whose **name** is secret-shaped **and** whose value is a credential-shaped literal (`sk-…`, `AKIA…`, `ghp_…`, `xox…`, long hex, long base64) |
+| `template-injection` | `jinja2.Environment(autoescape=False)`, or `Template(...)` / `env.from_string(...)` built from a **non-literal** template string (SSTI lead) |
+| `command-injection` | `subprocess.*(..., shell=True)` with a **non-literal** command, or `os.system` / `os.popen` with a non-literal argument |
 
 Each detector is **read-only** and **never runs the target** — it parses source text.
 
@@ -81,7 +85,7 @@ host-safe.
 
 v0.1 — a working first cut: a real CLI, a pure detector core with passing unit tests,
 fixtures (vulnerable + safe), and a SARIF + sealed-receipt path. Not a polished product.
-The ruleset is intentionally small (3 vendored access-control classes + 3 new rule groups),
+The ruleset is intentionally small (3 vendored access-control classes + 7 new rule groups),
 solid over broad.
 
 License: Apache-2.0.
