@@ -1,0 +1,45 @@
+name: scan
+# Runs aisec-check INSIDE the disposable GitHub Actions runner. The native detectors are host-safe
+# (stdlib + verity-core, read-only AST), but any OPTIONAL bundled third-party SAST scanner
+# (semgrep/bandit/dlint) is UNTRUSTED code and executes here only — a fresh VM torn down after the
+# job — never on a developer host. This is the project's isolation boundary.
+# (Pattern adapted from mcp-bench's scan.yml disposable-runner template.)
+on:
+  workflow_dispatch:
+  push:
+    paths: ["src/**", "tests/**", ".github/workflows/scan.yml"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install verity-core (family pin) + aisec-check
+        run: |
+          pip install "verity-core @ git+https://github.com/StellarRequiem/verity-core"
+          pip install -e ".[dev]"
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Self-scan the fixtures (leads only; does not fail the build)
+        continue-on-error: true
+        run: |
+          aisec-check scan tests/fixtures/vulnerable --sarif aisec.sarif --receipt aisec-receipt.json
+          echo "worst-severity exit was $?"
+          aisec-check verify --receipt aisec-receipt.json
+      - name: Upload SARIF + sealed receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: aisec-results-py${{ matrix.python-version }}
+          path: |
+            aisec.sarif
+            aisec-receipt.json

@@ -1,0 +1,36 @@
+name: "aisec-check"
+description: "Lexical/AST first-cut linter for AI-app vuln classes; emits SARIF + a verity-sealed receipt (leads only)."
+inputs:
+  path:
+    description: "File or directory to scan."
+    required: false
+    default: "."
+  sarif:
+    description: "Path to write SARIF 2.1.0 output."
+    required: false
+    default: "aisec.sarif"
+  receipt:
+    description: "Path to write the sealed receipt."
+    required: false
+    default: "aisec-receipt.json"
+  fail-on:
+    description: "Fail the step if worst severity is at or above this level: none|low|medium|high|critical."
+    required: false
+    default: "high"
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: |
+        pip install "verity-core @ git+https://github.com/StellarRequiem/verity-core" >/dev/null
+        pip install "${{ github.action_path }}" >/dev/null
+        set +e
+        aisec-check scan "${{ inputs.path }}" --sarif "${{ inputs.sarif }}" --receipt "${{ inputs.receipt }}"
+        code=$?
+        # exit code = worst severity: 0 none, 1 low, 2 medium, 3 high, 4 critical
+        declare -A thr=( [none]=0 [low]=1 [medium]=2 [high]=3 [critical]=4 )
+        want=${thr[${{ inputs.fail-on }}]}
+        if [ "$code" -ge "$want" ] && [ "$want" -gt 0 ]; then
+          echo "aisec-check: worst severity (exit $code) >= fail-on threshold (${{ inputs.fail-on }}=$want)"; exit 1
+        fi
+        exit 0

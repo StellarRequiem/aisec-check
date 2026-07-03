@@ -1,0 +1,35 @@
+[project]
+name = "aisec-check"
+version = "0.1.0"
+description = "Lexical/AST first-cut CI linter for AI-app vulnerability classes (leads only)."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "StellarRequiem" }]
+license = { text = "Apache-2.0" }
+
+# verity-core is pinned to ONE version across the whole verification-layer family so sealed
+# receipts cross-verify (shared canonical-JSON + hash chain). It is our own package, installed
+# from source into the per-repo .venv (not published to PyPI); the version pin is what matters.
+dependencies = [
+  "verity-core==0.1.0",
+]
+
+[project.optional-dependencies]
+# mcp-bench (published, Apache-2.0) supplies parse_sarif/wilson_ci for normalizing bundled
+# 3rd-party SARIF scanners in the disposable CI runner. Optional: the native detectors need
+# nothing beyond the stdlib + verity-core.
+scanners = ["mcp-bench"]
+dev = ["pytest"]
+
+[project.scripts]
+aisec-check = "aisec_check.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aisec_check"]
