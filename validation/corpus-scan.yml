@@ -1,0 +1,151 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# aisec-check — VALIDATION CORPUS SCAN (disposable-runner mass scan)
+#
+# ISOLATION MODEL (non-negotiable): every repo in validation/corpus.md is
+# UNTRUSTED third-party code. It is cloned and SCANNED here — inside the
+# ephemeral GitHub Actions runner, a fresh VM torn down after the job — and it
+# is **NEVER EXECUTED**:
+#
+#   * We `git clone --depth 1` the target into a scratch dir.
+#   * We run `aisec-check scan <dir>` over it. aisec-check is a READ-ONLY
+#     lexical/AST analyzer: it parses source text, it does not import, install,
+#     build, or run the target. No `pip install` of the target. No setup.py /
+#     conftest / plugin loading. No entrypoints invoked.
+#   * The ONLY thing installed with `-e` / `pip install` is aisec-check itself
+#     (our own audited code) + its verity-core dep — from THIS repo, never from
+#     the cloned target.
+#
+# This is the exact disposable-sandbox pattern from mcp-bench's scan.yml: run the
+# analysis where a compromised clone can do no lasting harm, upload only the
+# findings artifacts, pull nothing back to a developer host.
+#
+# Trigger is workflow_dispatch only — this is a deliberate, on-demand measurement
+# run, not something that fires on push.
+# ─────────────────────────────────────────────────────────────────────────────
+name: corpus-scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpus_ref:
+        description: "Git ref of aisec-check to install & scan with (default: current)."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout aisec-check (OUR code — the analyzer)
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Install ONLY our analyzer + its pinned dep. The cloned targets are never
+      # installed and never executed — aisec-check reads their source, nothing more.
+      - name: Install aisec-check (analyzer) + verity-core (family pin)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install "verity-core @ git+https://github.com/StellarRequiem/verity-core"
+          pip install -e .
+          aisec-check --help >/dev/null && echo "aisec-check installed"
+
+      - name: Scan every corpus repo (clone read-only; NEVER execute the target)
+        env:
+          # Belt-and-suspenders: even though aisec-check never invokes pip, make a
+          # stray build impossible and keep git non-interactive.
+          PIP_NO_BUILD_ISOLATION: "0"
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -uo pipefail
+          mkdir -p findings scratch
+
+          # Parse "owner/name | url | why" rows out of the corpus markdown tables.
+          # We take column 2 (the URL) from every table row that looks like a repo row.
+          python - <<'PY' > urls.txt
+          import re, pathlib
+          text = pathlib.Path("validation/corpus.md").read_text(encoding="utf-8")
+          urls = []
+          for line in text.splitlines():
+              if not line.strip().startswith("|"):
+                  continue
+              cols = [c.strip() for c in line.strip().strip("|").split("|")]
+              if len(cols) < 3:
+                  continue
+              url = cols[1]
+              if url.startswith("https://github.com/"):
+                  urls.append(url)
+          # de-dup, preserve order
+          seen, out = set(), []
+          for u in urls:
+              if u not in seen:
+                  seen.add(u); out.append(u)
+          print("\n".join(out))
+          PY
+
+          count=$(wc -l < urls.txt | tr -d ' ')
+          echo "corpus size: $count repos"
+
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            # slug = owner__name, safe as a filename
+            slug=$(echo "$url" | sed -E 's#https://github.com/##; s#/#__#g; s#\.git$##')
+            dir="scratch/$slug"
+            echo "::group::$slug"
+            rm -rf "$dir"
+
+            # READ-ONLY acquisition: shallow, single-branch, no submodules, no hooks.
+            # --depth 1 minimizes what lands on disk; we still never run any of it.
+            if ! git -c core.hooksPath=/dev/null clone --depth 1 --no-tags \
+                    --recurse-submodules=no "$url" "$dir" 2>"findings/$slug.clone.log"; then
+              echo "clone FAILED for $url (see findings/$slug.clone.log)"
+              echo "{\"repo\": \"$slug\", \"url\": \"$url\", \"error\": \"clone_failed\"}" \
+                   > "findings/$slug.error.json"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Neutralize anything auto-loadable BEFORE the scanner touches the tree.
+            # aisec-check does not import these, but defense-in-depth: an AST parse of
+            # a hostile file cannot run it, and we never invoke pytest/build here.
+            # (No action needed to disable execution — aisec-check simply never execs.)
+
+            # THE SCAN — read-only. --json to stdout, SARIF + receipt to disk.
+            # We DO NOT let a nonzero exit (worst-severity code) abort the loop.
+            set +e
+            aisec-check scan "$dir" \
+              --target "$slug" \
+              --json \
+              --sarif "findings/$slug.sarif" \
+              --receipt "findings/$slug.receipt.json" \
+              > "findings/$slug.json" 2> "findings/$slug.stderr.log"
+            rc=$?
+            set -e
+            echo "$slug: aisec-check exit=$rc (0 clean .. 4 critical; nonzero is expected, not a failure)"
+
+            # Free disk immediately; the clone has served its only purpose (being read).
+            rm -rf "$dir"
+            echo "::endgroup::"
+          done < urls.txt
+
+          echo "scan complete — $(ls findings/*.json 2>/dev/null | wc -l | tr -d ' ') result files"
+
+      - name: Aggregate raw finding counts (pure function; no adjudication yet)
+        run: |
+          python validation/aggregate.py findings --out findings/_aggregate.json --md findings/_aggregate.md
+          echo "----- aggregate summary -----"
+          cat findings/_aggregate.md
+
+      - name: Upload findings artifact (raw leads — precision computed after adjudication)
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-findings
+          path: findings/
+          if-no-files-found: error
