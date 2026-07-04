@@ -64,6 +64,259 @@ def _looks_secret(text: str) -> bool:
     return any(h in t for h in _SECRET_HINTS)
 
 
+# ── controllability analysis (the precision core) ────────────────────────────────────────
+# The dominant false-positive across every "non-literal → flag" rule was treating ANY
+# variable as attacker-controlled. In real infra the argument is almost always a
+# module-level constant, a config value, a literal-built string, or a wrapped Request
+# object around a literal URL. These helpers answer the question the old rules skipped:
+# *is this value plausibly derived from external / request / caller input?* Only then is it
+# a lead. This is still lexical/AST (no real dataflow) — it under-claims by design.
+
+# names that, as request-object receivers, signal request/caller-controlled input
+_REQUEST_HINTS = ("request", "req", "flask.request", "self.request", "event", "payload",
+                  "body", "params", "query", "form", "args", "json", "input", "user_input",
+                  "message", "msg", "prompt", "untrusted", "external")
+# safe module leaves whose calls produce a literal/config-derived value (env, config, settings)
+_SAFE_SOURCE_LEAVES = ("getenv", "environ", "get", "config", "settings", "getconfig")
+
+
+def _is_const_str_expr(node) -> bool:
+    """True if this expression evaluates to a string built ONLY from literals / joined
+    literals (no Name/param/call). e.g. 'a' , 'a' + 'b', f'{PREFIX_LITERAL}...' with no names."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.JoinedStr):  # f-string
+        return all(
+            isinstance(v, ast.Constant) or (isinstance(v, ast.FormattedValue) and _is_const_str_expr(v.value))
+            for v in node.values
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _is_const_str_expr(node.left) and _is_const_str_expr(node.right)
+    return False
+
+
+class _Scope:
+    """Per-function view: which names are parameters (controllable), and which local names are
+    bound to a value we can prove is NOT external (a literal, a module-const, a Request-wrapping
+    of a safe URL). Module-level constants are also collected so a config URL is treated safe."""
+
+    def __init__(self, module: ast.AST, func: ast.AST | None):
+        self.params: set[str] = set()
+        # names bound to a provably-safe (literal / const / env / config) value in this scope
+        self.safe_names: set[str] = set()
+        # names bound to Request(<safe-url>) — the wrapped-literal-Request pattern
+        self.safe_request_names: set[str] = set()
+
+        # module-level constants: ALL_CAPS or assigned a literal / env / config expr → safe source
+        self.module_consts: set[str] = set()
+        for n in module.body if isinstance(module, ast.Module) else []:
+            if isinstance(n, (ast.Assign, ast.AnnAssign)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                val = n.value
+                for t in targets:
+                    nm = _name(t)
+                    if not nm:
+                        continue
+                    if nm.isupper() or (val is not None and self._safe_value(val, module_pass=True)):
+                        self.module_consts.add(nm)
+
+        if func is not None:
+            a = getattr(func, "args", None)
+            if a:
+                for arg in list(a.args) + list(a.kwonlyargs) + list(a.posonlyargs or []):
+                    self.params.add(arg.arg)
+                if a.vararg:
+                    self.params.add(a.vararg.arg)
+                if a.kwarg:
+                    self.params.add(a.kwarg.arg)
+            # walk the function body IN ORDER, tracking local safe bindings
+            for stmt in ast.walk(func):
+                if isinstance(stmt, ast.Assign):
+                    for t in stmt.targets:
+                        nm = _name(t)
+                        if not nm:
+                            continue
+                        if self._is_request_of_safe_url(stmt.value):
+                            self.safe_request_names.add(nm)
+                        elif self._safe_value(stmt.value):
+                            self.safe_names.add(nm)
+                # `for x in <module-const/config>:` — the loop var is config-derived, not external.
+                # e.g. `for name, url in NEWS_FEEDS.items():` iterates a module-level constant dict,
+                # so `url` is a config value, NOT attacker input (a dominant SSRF false positive).
+                elif isinstance(stmt, ast.For) and self._iterates_safe(stmt.iter):
+                    for nm in self._bound_names(stmt.target):
+                        self.safe_names.add(nm)
+
+    def _safe_value(self, node, module_pass: bool = False) -> bool:
+        """Is this RHS a value we can treat as non-external? Literals, module-consts, env/config
+        reads, and simple ops over those. Conservative: unknown calls/names are NOT safe."""
+        if node is None:
+            return False
+        if _is_const_str_expr(node):
+            return True
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.Name):
+            if module_pass:
+                return node.id.isupper()
+            return node.id in self.module_consts or node.id in self.safe_names
+        if isinstance(node, ast.Attribute):
+            # os.environ / settings.X / config.X style — treated as config, not request input
+            leaf = node.attr.lower()
+            root = _name(node).split(".")[0].lower()
+            return root in ("os", "settings", "config", "cfg", "env") or leaf in _SAFE_SOURCE_LEAVES
+        if isinstance(node, ast.Call):
+            leaf = _name(node.func).split(".")[-1].lower()
+            return leaf in _SAFE_SOURCE_LEAVES
+        if isinstance(node, ast.JoinedStr):
+            # f-string safe iff every interpolated piece is safe (const or safe name/config)
+            return all(
+                isinstance(v, ast.Constant) or (isinstance(v, ast.FormattedValue) and self._safe_value(v.value))
+                for v in node.values
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return self._safe_value(node.left) and self._safe_value(node.right)
+        return False
+
+    def _is_request_of_safe_url(self, node) -> bool:
+        """True if node is urllib...Request(<safe-url>, ...) — a wrapped literal/config URL."""
+        if not isinstance(node, ast.Call):
+            return False
+        if _name(node.func).split(".")[-1] != "Request":
+            return False
+        url = node.args[0] if node.args else None
+        if url is None:
+            return False
+        # a wrapped literal/config URL, OR a host-pinned URL (constant host, variable path) — both
+        # are non-redirectable, so a Request() around either is a safe (allowlisted) fetch target.
+        return self._safe_value(url) or self._host_is_pinned(url)
+
+    @staticmethod
+    def _bound_names(target) -> list[str]:
+        """Names bound by a for-loop target (handles tuple/list unpacking)."""
+        out: list[str] = []
+        if isinstance(target, ast.Name):
+            out.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for el in target.elts:
+                if isinstance(el, ast.Name):
+                    out.append(el.id)
+        return out
+
+    def _iterates_safe(self, node) -> bool:
+        """True if a for-loop iterable is a module-const / config value (so its loop var is not
+        external). Covers ``CONST``, ``CONST.items()``/``.values()``, and ``config.X``."""
+        if node is None:
+            return False
+        if self._safe_value(node):
+            return True
+        # CONST.items() / CONST.values() / CONST.keys()
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in ("items", "values", "keys"):
+            return self._safe_value(node.func.value)
+        return False
+
+    def _host_is_pinned(self, node) -> bool:
+        """SSRF-specific: True if this URL expression has a CONSTANT scheme+host and only a
+        variable *path/query suffix*. Redirecting the fetch to another host is impossible, so it
+        is not SSRF (the dominant safe pattern: ``f'{BASE_URL}{path}'`` / ``BASE + path``). We
+        approximate 'leading component is a safe constant' — the host is fixed by construction."""
+        if isinstance(node, ast.JoinedStr):
+            if not node.values:
+                return False
+            first = node.values[0]
+            # leading literal must carry the scheme+authority, e.g. 'http://host/...'
+            if isinstance(first, ast.Constant) and isinstance(first.value, str) and "://" in first.value:
+                return True
+            # or a leading interpolation of a safe (const/config) base URL: f'{BASE}{path}'
+            if isinstance(first, ast.FormattedValue) and self._safe_value(first.value):
+                return True
+            return False
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            # walk to the left-most operand — that's the host-bearing base
+            left = node.left
+            while isinstance(left, ast.BinOp) and isinstance(left.op, ast.Add):
+                left = left.left
+            if isinstance(left, ast.Constant) and isinstance(left.value, str) and "://" in left.value:
+                return True
+            return self._safe_value(left)
+        return False
+
+    def is_external_url(self, node) -> bool:
+        """SSRF gate: like ``is_external`` but treats a host-PINNED URL (constant scheme+host,
+        variable path suffix) as SAFE — you cannot redirect the fetch to an attacker host, so it
+        is not SSRF even though a substring is caller-derived."""
+        if self._host_is_pinned(node):
+            return False
+        return self.is_external(node)
+
+    def is_external(self, node) -> bool:
+        """The precision gate: is this argument PLAUSIBLY attacker/request/caller-controlled?
+        True  → a real lead (param, request object, or a string built from one).
+        False → a literal, module-const, config value, or a wrapped-literal Request (SAFE)."""
+        if node is None:
+            return False
+        # a provably-safe local / literal / config value is never external
+        if self._safe_value(node):
+            return False
+        if isinstance(node, ast.Name):
+            if node.id in self.safe_request_names or node.id in self.safe_names \
+                    or node.id in self.module_consts:
+                return False
+            if node.id in self.params:
+                return True
+            # a request-shaped local name (request/event/payload/body/...) is a lead
+            return node.id.lower() in _REQUEST_HINTS
+        if isinstance(node, ast.Attribute):
+            # request.args / flask.request.json / self.request.body → controllable
+            dotted = _name(node).lower()
+            return any(h in dotted.split(".") for h in _REQUEST_HINTS)
+        if isinstance(node, ast.Subscript):
+            # request.args['u'] / payload['url'] → follow the receiver
+            return self.is_external(node.value)
+        if isinstance(node, ast.JoinedStr):
+            # an f-string is a lead iff ANY interpolated piece is external
+            return any(isinstance(v, ast.FormattedValue) and self.is_external(v.value)
+                       for v in node.values)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return self.is_external(node.left) or self.is_external(node.right)
+        if isinstance(node, ast.Call):
+            # unknown call result: not a lead unless an argument is external (e.g. sanitize(user))
+            return any(self.is_external(a) for a in node.args)
+        return False
+
+
+class _ScopeIndex:
+    """Maps each Call node to the _Scope of its innermost enclosing function (module scope if
+    top-level). Built once per tree; scopes are memoized per function node."""
+
+    def __init__(self, tree: ast.AST):
+        self._module = tree
+        self._parent: dict[int, ast.AST] = {}
+        self._func_of: dict[int, ast.AST | None] = {}
+        self._scopes: dict[int, _Scope] = {}
+        stack: list[ast.AST | None] = [None]  # current enclosing function
+        self._build(tree, stack)
+
+    def _build(self, node, stack):
+        cur_func = stack[-1]
+        for child in ast.iter_child_nodes(node):
+            self._func_of[id(child)] = cur_func
+            is_func = isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            stack.append(child if is_func else cur_func)
+            self._build(child, stack)
+            stack.pop()
+
+    def scope_for(self, call: ast.Call) -> "_Scope":
+        func = self._func_of.get(id(call))
+        key = id(func) if func is not None else 0
+        sc = self._scopes.get(key)
+        if sc is None:
+            sc = _Scope(self._module, func)
+            self._scopes[key] = sc
+        return sc
+
+
 def _draft(target, program, fc, title, sev, text, file, line, extra=None) -> FindingDraft:
     ev = {"file": file, "line": line, "pattern": fc, "detector": "aisec-rules"}
     if extra:
@@ -280,10 +533,23 @@ def _http_url_arg(call: ast.Call):
     return None
 
 
+def _unwrap_request_url(node):
+    """If ``node`` is an inline ``Request(url, ...)`` call, return its URL arg (the thing actually
+    fetched). Otherwise return ``node`` unchanged. Lets ``urlopen(Request(url))`` see through the
+    wrapper to the real URL — while ``urlopen(req)`` is resolved via the scope's safe_request_names."""
+    if isinstance(node, ast.Call) and _name(node.func).split(".")[-1] == "Request":
+        return node.args[0] if node.args else node
+    return node
+
+
 def scan_ssrf_url_fetch(tree: ast.AST, *, file: str, target: str, program: str) -> list:
-    """Flag an HTTP fetch whose URL is a non-literal (variable / f-string / param). A literal
-    URL is treated as an in-call allowlist and is NOT flagged. Lead-only: does not prove the
-    variable is externally controlled — a human confirms the taint source."""
+    """Flag an HTTP fetch ONLY when the URL is plausibly attacker/request/caller-controlled — a
+    function parameter, a request/event object, or a string built from one. A literal URL, a
+    module-level constant/config URL, or a ``Request(...)`` wrapping any of those is treated as an
+    in-code allowlist and is NOT flagged (that wrapped-literal-Request / constant-base-URL pattern
+    was the dominant false positive). Lead-only: confirms the URL is non-literal AND has a
+    plausible external source; a human still verifies the taint reaches an untrusted boundary."""
+    index = _ScopeIndex(tree)
     drafts = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -291,13 +557,20 @@ def scan_ssrf_url_fetch(tree: ast.AST, *, file: str, target: str, program: str) 
         url_arg = _http_url_arg(node)
         if url_arg is None or _is_literal_url(url_arg):
             continue
+        scope = index.scope_for(node)
+        # see through an inline Request(...) wrapper to the URL it carries
+        effective = _unwrap_request_url(url_arg)
+        # is_external_url (not is_external): a host-pinned URL (constant scheme+host, variable path
+        # suffix) is NOT SSRF — the fetch cannot be redirected to an attacker-chosen host.
+        if not scope.is_external_url(effective):
+            continue
         dotted = _name(node.func)
         drafts.append(_draft(
             target, program, "ssrf-url-fetch",
-            f"Server-side fetch of a non-literal URL via {dotted}()",
+            f"Server-side fetch of an externally-derived URL via {dotted}()",
             "high",
-            f"`{dotted}()` fetches a URL taken from a variable/parameter (no in-call literal "
-            f"allowlist) — if the URL is caller/model-controlled this is SSRF",
+            f"`{dotted}()` fetches a URL derived from a parameter/request/external input (not a "
+            f"literal or module constant) — if that source is caller/model-controlled this is SSRF",
             file, node.lineno, {"sink": dotted}))
     return drafts
 
@@ -314,14 +587,28 @@ _SECRET_VALUE_PATTERNS = (
 )
 
 
+# obvious non-secret markers: placeholders, honeypots, examples, and test bait. A value carrying
+# any of these is a deliberately-fake credential (the dominant hardcoded-secret false positive —
+# e.g. an ``EXAMPLE`` AWS key or a planted ``sk-honeypot-…`` bait) and must NOT be flagged.
+_FAKE_SECRET_MARKERS = ("example", "honeypot", "do-not", "donotuse", "dummy", "placeholder",
+                        "changeme", "your-", "yourkey", "xxxx", "redacted", "sample",
+                        "fake", "notreal", "sanitized", "deadbeefdeadbeef")
+
+
 def _looks_secret_value(text: str) -> bool:
-    """True if the string literal has the SHAPE of a real credential. Conservative: a short
-    or human-word value (e.g. 'changeme', 'password') does NOT match — we require a
-    high-entropy / prefixed shape to keep this a precise lead."""
+    """True if the string literal has the SHAPE of a real credential AND is not an obvious
+    placeholder/example/honeypot. Conservative on both ends: a short or human-word value
+    (e.g. 'changeme', 'password') does NOT match the shape; and a shaped-but-fake value
+    (AKIA…EXAMPLE, sk-honeypot-…, test/dummy tokens) is excluded so bait/fixtures don't fire."""
     if not isinstance(text, str):
         return False
     t = text.strip()
-    return any(p.match(t) for p in _SECRET_VALUE_PATTERNS)
+    if not any(p.match(t) for p in _SECRET_VALUE_PATTERNS):
+        return False
+    low = t.lower()
+    if any(m in low for m in _FAKE_SECRET_MARKERS):
+        return False
+    return True
 
 
 def scan_hardcoded_secret(tree: ast.AST, *, file: str, target: str, program: str) -> list:

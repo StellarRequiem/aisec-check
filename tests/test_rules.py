@@ -94,19 +94,61 @@ def test_session_request_method_url_flagged():
     assert "ssrf-url-fetch" in _classes(src)
 
 
+# ── R4 SAFE patterns: the dominant real-infra false positives that must NOT fire ─────────
+def test_ssrf_module_const_url_safe():
+    # requests.get(MODULE_CONST) — a config/base URL, not attacker input
+    src = "import requests\nAPI = 'https://api.example.com/health'\nrequests.get(API)\n"
+    assert "ssrf-url-fetch" not in _classes(src)
+
+
+def test_ssrf_wrapped_request_const_url_safe():
+    # urlopen(Request(MODULE_CONST)) — the wrapped-literal-Request infra pattern
+    src = ("import urllib.request\nURL = 'http://127.0.0.1:8800/x'\n"
+           "def f():\n    req = urllib.request.Request(URL)\n    return urllib.request.urlopen(req)\n")
+    assert "ssrf-url-fetch" not in _classes(src)
+
+
+def test_ssrf_host_pinned_path_suffix_safe():
+    # f'{BASE}{path}' — constant host, only the PATH varies → not redirectable → not SSRF
+    src = ("import requests\nBASE = 'https://api.example.com'\n"
+           "def f(path):\n    return requests.get(f'{BASE}{path}')\n")
+    assert "ssrf-url-fetch" not in _classes(src)
+
+
+def test_ssrf_const_base_concat_safe():
+    # BASE + '/literal' — host pinned by a module const
+    src = ("import requests\nBASE = 'https://api.example.com'\n"
+           "def f():\n    return requests.get(BASE + '/v1/status')\n")
+    assert "ssrf-url-fetch" not in _classes(src)
+
+
+def test_ssrf_config_loop_var_safe():
+    # for url in FEEDS.values(): urlopen(Request(url)) — loop var over a module-const dict
+    src = ("import urllib.request\nFEEDS = {'a': 'https://x.example/rss'}\n"
+           "def f():\n    for name, url in FEEDS.items():\n"
+           "        req = urllib.request.Request(url)\n        urllib.request.urlopen(req)\n")
+    assert "ssrf-url-fetch" not in _classes(src)
+
+
+def test_ssrf_param_url_still_flagged():
+    # regression guard: a genuinely param-derived URL (no host pin) MUST still fire
+    src = "import requests\ndef f(url):\n    return requests.get(url)\n"
+    assert "ssrf-url-fetch" in _classes(src)
+
+
 # ── R5: hardcoded secret literal ─────────────────────────────────────────────────────────
 def test_hardcoded_openai_key_flagged():
-    src = "api_key = 'sk-abcdef0123456789abcdef0123456789'\n"
+    src = "api_key = 'sk-Jk3nQ8vRtLpW2xYz7bMdF4aH'\n"
     assert "hardcoded-secret" in _classes(src)
 
 
 def test_hardcoded_aws_key_flagged():
-    src = "AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\n"
+    src = "AWS_ACCESS_KEY_ID = 'AKIAJ7QK3NP2WXYZ4RTL'\n"
     assert "hardcoded-secret" in _classes(src)
 
 
 def test_secret_kwarg_literal_flagged():
-    src = "connect(password='AKIAIOSFODNN7EXAMPLE')\n"
+    src = "connect(password='AKIAJ7QK3NP2WXYZ4RTL')\n"
     assert "hardcoded-secret" in _classes(src)
 
 
@@ -118,6 +160,17 @@ def test_secret_name_nonsecret_value_safe():
 def test_secretshaped_value_nonsecret_name_safe():
     # a long hex value bound to a non-secret name → not flagged (requires both)
     assert "hardcoded-secret" not in _classes("checksum = '" + "a" * 40 + "'\n")
+
+
+def test_honeypot_bait_token_not_flagged():
+    # a deliberately-fake honeypot/bait credential must NOT fire (dominant secret FP)
+    src = "HONEYPOT_TOKEN = 'sk-honeypot-DO-NOT-EXFILTRATE-7f3a91'\n"
+    assert "hardcoded-secret" not in _classes(src)
+
+
+def test_example_aws_key_not_flagged():
+    # AWS docs 'EXAMPLE' key — a placeholder, not a live credential
+    assert "hardcoded-secret" not in _classes("AWS_ACCESS_KEY_ID = 'AKIAIOSFODNN7EXAMPLE'\n")
 
 
 # ── R6: template injection (SSTI) ────────────────────────────────────────────────────────

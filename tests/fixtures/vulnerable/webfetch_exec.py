@@ -23,9 +23,9 @@ def fetch_bad3(loc):
     return urlopen(loc)
 
 
-# R5: hardcoded credential-shaped literals in source
-API_KEY = "sk-abcdef0123456789abcdef0123456789"
-AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
+# R5: hardcoded credential-shaped literals in source (realistic shapes, not doc "EXAMPLE" bait)
+API_KEY = "sk-Jk3nQ8vRtLpW2xYz7bMdF4aH"
+AWS_ACCESS_KEY_ID = "AKIAJ7QK3NP2WXYZ4RTL"
 
 
 def render_bad(user_template):

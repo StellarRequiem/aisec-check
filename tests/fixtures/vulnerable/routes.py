@@ -24,10 +24,10 @@ def list_all_users():
     return {"users": ["everyone"]}
 
 
-# IDOR: client-supplied id, no auth dependency
+# IDOR: client-supplied id looked up with no auth and no owner/current_user binding
 @app.get("/orders/{order_id}")
 def get_order(order_id: str):
-    return {"order": order_id}
+    return {"order": Order.query.get(order_id)}
 
 
 # SECRET LEAK: serialises an api_key field

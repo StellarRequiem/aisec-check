@@ -130,19 +130,141 @@ def _id_params(func: ast.AST) -> list:
     return [n for n in names if n.lower() in _ID_PARAMS or n.lower().endswith("_id")]
 
 
-def _returns_secret(func: ast.AST) -> str:
-    """A secret-shaped key referenced in a dict/return inside the handler (heuristic leak signal)."""
+def _handler_param_names(func: ast.AST) -> set:
+    """The route handler's own parameter names — the caller-controllable inputs. A sink fed one of
+    these is a real lead; a sink fed a module const / literal / config value is not."""
+    args = getattr(func, "args", None)
+    if not args:
+        return set()
+    out = set()
+    for a in list(args.args) + list(args.kwonlyargs) + list(getattr(args, "posonlyargs", []) or []):
+        out.add(a.arg)
+    if args.vararg:
+        out.add(args.vararg.arg)
+    if args.kwarg:
+        out.add(args.kwarg.arg)
+    return out
+
+
+def _module_consts(tree: ast.AST) -> set:
+    """Module-level constant names (ALL_CAPS or literal-assigned) — config/base values, not input."""
+    out = set()
+    body = tree.body if isinstance(tree, ast.Module) else []
+    for n in body:
+        if isinstance(n, (ast.Assign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for t in targets:
+                nm = _name(t)
+                if nm and (nm.isupper() or isinstance(getattr(n, "value", None), ast.Constant)):
+                    out.add(nm)
+    return out
+
+
+def _leaves_of(node) -> set:
+    """The set of bare Name leaves referenced anywhere under an expression (the taint fringe)."""
+    return {sub.id for sub in ast.walk(node) if isinstance(sub, ast.Name)}
+
+
+def _arg_is_controllable(arg, params: set, consts: set) -> bool:
+    """Is this sink argument plausibly caller-controlled? Precision-first: True ONLY when the
+    expression references a handler PARAMETER (the request-controllable input). A literal, a
+    module const (``os.path.join(BASE, 'static')``), or an unknown global (a session/config object)
+    is NOT treated as a lead — that 'any non-constant arg fires' shape was the dominant FP."""
+    if isinstance(arg, ast.Constant):
+        return False
+    leaves = _leaves_of(arg)
+    return bool(leaves & params)
+
+
+_QUERY_LEAVES = ("get", "filter", "filter_by", "find", "find_one", "query", "get_or_404",
+                 "first", "one", "fetch", "fetchone", "execute", "select", "where", "objects")
+_OWNER_HINTS = ("current_user", "request.user", "user_id", "owner", "owner_id", "g.user",
+                "auth_user", "principal", "session", "self.user")
+
+
+def _queries_by_id(func: ast.AST, ids: list) -> bool:
+    """True if the handler passes a client id param into a DB/lookup call (``.get(id)`` /
+    ``.filter_by(id=id)`` / ``query(...id...)`` / ``get_or_404(id)``). Without an actual lookup
+    keyed by the id, an id param alone is not an IDOR — it may just be echoed or logged."""
+    idset = set(ids)
     for sub in ast.walk(func):
-        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
-            if sub.value.lower() in _SECRET_KEYS:
-                return sub.value
-        if isinstance(sub, ast.Attribute) and sub.attr.lower() in _SECRET_KEYS:
-            return sub.attr
+        if not isinstance(sub, ast.Call):
+            continue
+        if _name(sub.func).split(".")[-1].lower() not in _QUERY_LEAVES:
+            continue
+        for a in sub.args:
+            if isinstance(a, ast.Name) and a.id in idset:
+                return True
+        for kw in sub.keywords:
+            if isinstance(kw.value, ast.Name) and kw.value.id in idset:
+                return True
+    return False
+
+
+def _has_owner_binding(func: ast.AST) -> bool:
+    """True if the handler references a current-user / owner / session binding anywhere — a signal
+    the lookup is scoped to the authenticated principal (so it is likely NOT an IDOR)."""
+    for sub in ast.walk(func):
+        dotted = ""
+        if isinstance(sub, ast.Name):
+            dotted = sub.id.lower()
+        elif isinstance(sub, ast.Attribute):
+            dotted = _name(sub).lower()
+        else:
+            continue
+        if any(h in dotted for h in _OWNER_HINTS):
+            return True
+    return False
+
+
+def _returns_secret(func: ast.AST) -> str:
+    """A secret-shaped key SERIALISED in a value the handler RETURNS (the leak signal). Precision:
+    only a secret-shaped key that appears as a dict KEY inside a ``return``/response expression
+    counts — a mere reference (hashing/comparing a password, reading a token to *use* it) does NOT.
+    That 'any secret word anywhere in the body' shape was a dominant false positive."""
+    # collect the expressions the handler actually hands back to the caller
+    returned: list = []
+    for sub in ast.walk(func):
+        if isinstance(sub, ast.Return) and sub.value is not None:
+            returned.append(sub.value)
+        # common response idioms: JSONResponse(...) / jsonify(...) / Response(content=...)
+        elif isinstance(sub, ast.Call):
+            leaf = _name(sub.func).split(".")[-1].lower()
+            if leaf in ("jsonresponse", "jsonify", "response", "dict"):
+                returned.extend(sub.args)
+                returned.extend(kw.value for kw in sub.keywords)
+    for expr in returned:
+        for sub in ast.walk(expr):
+            # secret-shaped DICT KEY in a returned dict: {"api_key": ...} → serialised to caller
+            if isinstance(sub, ast.Dict):
+                for k in sub.keys:
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str) \
+                            and k.value.lower() in _SECRET_KEYS:
+                        return k.value
+            # returning an object's secret attribute: return user.password
+            if isinstance(sub, ast.Attribute) and sub.attr.lower() in _SECRET_KEYS:
+                return sub.attr
     return ""
 
 
-def _sinks(func: ast.AST) -> list:
-    """HTTP-client + path sinks called with a NON-constant (likely user-derived) argument."""
+def _open_is_read(call: ast.Call) -> bool:
+    """True if this ``open(path, 'r')`` is a READ (default or explicit 'r'/'rb'). A read-mode open
+    of a path is not a write/traversal sink worth flagging by itself — cuts config-read FPs."""
+    mode = None
+    if len(call.args) >= 2 and isinstance(call.args[1], ast.Constant):
+        mode = call.args[1].value
+    for kw in call.keywords:
+        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+            mode = kw.value.value
+    if mode is None:
+        return True                      # default mode is 'r'
+    return isinstance(mode, str) and mode.startswith("r") and "+" not in mode
+
+
+def _sinks(func: ast.AST, params: set, consts: set) -> list:
+    """HTTP-client + path sinks called with a HANDLER-PARAMETER-derived argument. Precision-first:
+    a sink fed only a literal / module const / config object is NOT a lead (the 'any non-constant
+    arg fires' shape was the dominant false positive)."""
     hits = []
     for sub in ast.walk(func):
         if not isinstance(sub, ast.Call):
@@ -150,10 +272,15 @@ def _sinks(func: ast.AST) -> list:
         dotted = _name(sub.func)
         leaf = dotted.split(".")[-1].lower()
         root = dotted.split(".")[0].lower()
-        nonconst = any(not isinstance(a, ast.Constant) for a in sub.args)
-        if leaf in _HTTP_CALLS and (root in _HTTP_MODS or "client" in root or "session" in root) and nonconst:
+        controllable = any(_arg_is_controllable(a, params, consts) for a in sub.args)
+        if not controllable:
+            continue
+        if leaf in _HTTP_CALLS and (root in _HTTP_MODS or "client" in root or "session" in root):
             hits.append(("ssrf", dotted))
-        elif leaf in _PATH_SINKS and nonconst and ("path" in dotted.lower() or leaf in ("open", "replace")):
+        elif leaf in _PATH_SINKS and ("path" in dotted.lower() or leaf in ("open", "replace")):
+            # a read-only open() of a param path is far weaker; require write/other path sinks
+            if leaf == "open" and _open_is_read(sub):
+                continue
             hits.append(("path-traversal", dotted))
     return hits
 
@@ -180,6 +307,7 @@ def scan_source(src: str, *, file: str, target: str, program: str = "") -> list:
     routes = [(f, r) for f, r in routes if r]
     gated = [f for f, r in routes if _has_auth(f)]
     ungated = [f for f, r in routes if not _has_auth(f)]
+    consts = _module_consts(tree)
     drafts = []
     # 1. AUTH ASYMMETRY — only meaningful when some siblings ARE gated (proves intent)
     if gated and ungated:
@@ -194,12 +322,16 @@ def scan_source(src: str, *, file: str, target: str, program: str = "") -> list:
     # 2/3/4 — per route handler
     for f, (method, path) in routes:
         ids = _id_params(f)
-        if ids and not _has_auth(f):
+        params = _handler_param_names(f)
+        # IDOR requires BOTH: a client id param used to look something up, AND no owner binding.
+        # Firing on 'any id param, ungated' alone was a dominant FP (many id params are used
+        # safely, and auth is often enforced by middleware not visible in the handler signature).
+        if ids and not _has_auth(f) and _queries_by_id(f, ids) and not _has_owner_binding(f):
             drafts.append(_draft(
                 target, program, "idor",
-                f"Possible IDOR: {method.upper()} {path or f.name} takes client id `{','.join(ids)}` without auth",
+                f"Possible IDOR: {method.upper()} {path or f.name} looks up client id `{','.join(ids)}` without auth or owner binding",
                 "high",
-                f"Handler `{f.name}` accepts client-supplied {ids} and is ungated — check for an owner/user_id binding before the DB access (the BOLA pattern)",
+                f"Handler `{f.name}` accepts client-supplied {ids}, looks up by it, and shows no owner/current_user binding — the BOLA pattern",
                 file, f.lineno, {"id_params": ids, "method": method}))
         sk = _returns_secret(f)
         if sk:
@@ -207,9 +339,9 @@ def scan_source(src: str, *, file: str, target: str, program: str = "") -> list:
                 target, program, "secret-leak",
                 f"Possible secret exposure ({sk}) in {method.upper()} {path or f.name}",
                 "high",
-                f"Handler `{f.name}` references secret-shaped field `{sk}` in its body/return — check it is not serialised to the caller in cleartext",
+                f"Handler `{f.name}` serialises secret-shaped field `{sk}` in a returned value — check it is not sent to the caller in cleartext",
                 file, f.lineno, {"secret_field": sk}))
-        for cls, sink in _sinks(f):
+        for cls, sink in _sinks(f, params, consts):
             drafts.append(_draft(
                 target, program, cls,
                 f"Possible {cls.upper()} via {sink}() in {method.upper()} {path or f.name}",
