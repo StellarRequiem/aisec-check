@@ -2,8 +2,10 @@
 
 A **lexical / AST first-cut** CI linter for the vulnerability classes that recur in
 AI-built apps and MCP servers. It scans Python source **read-only**, emits **leads**
-(candidate findings a human must confirm), and seals the finding set into a
-tamper-evident receipt.
+(candidate findings a human must confirm), and seals the finding set into an
+integrity-checked receipt (an unkeyed hash that detects corruption, reordering, or
+truncation — **not** tamper-evidence against a determined rewrite; see the threat
+model below).
 
 > **Honest scope — read this first.** aisec-check is a *lexical and AST* scanner. It
 > matches syntactic shapes — call names, decorator/argument kinds, secret-shaped

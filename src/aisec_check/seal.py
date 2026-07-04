@@ -1,6 +1,7 @@
-"""Seal a finding set into a tamper-evident receipt, committing to a hash of the exact
+"""Seal a finding set into an integrity-checked receipt, committing to a hash of the exact
 scan inputs (repo target + normalized findings), and record it on an append-only
-``AuditChain``.
+``AuditChain``. The unkeyed root detects corruption/reordering/truncation — it is NOT
+tamper-evidence against a determined rewrite (that needs a key or an anchored chain head).
 
 Reuses ``verity-core``'s canonical-JSON→sha256 ``entry_hash`` + ``AuditChain`` — we do
 NOT roll our own crypto or fork the hash chain. This is the same sealing pattern
